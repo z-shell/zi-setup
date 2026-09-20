@@ -11,8 +11,12 @@ import (
 )
 
 func TestBundledEngineDescribesAndPlansDisposableHome(t *testing.T) {
-	t.Parallel()
 	home := t.TempDir()
+	fakeBin := t.TempDir()
+	if err := os.WriteFile(filepath.Join(fakeBin, "zsh"), []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"))
 	workspace, err := (Client{TempParent: t.TempDir()}).NewWorkspace(Inputs{
 		Home:       home,
 		ConfigHome: filepath.Join(home, ".config", "zi"),
