@@ -142,6 +142,22 @@ func requireSHA256(field, value string) error {
 	return nil
 }
 
+func validateFactValue(id, value string) error {
+	allowed := map[string][]string{
+		"zi-home-state":    {"selected", "ambiguous"},
+		"zshrc-state":      {"skipped", "symlink", "file", "other", "missing"},
+		"git":              {"available", "missing"},
+		"zsh":              {"available", "missing"},
+		"tty":              {"yes", "no"},
+		"existing-profile": {"loader", "annex", "zunit", "none"},
+	}
+	values, restricted := allowed[id]
+	if !restricted {
+		return nil
+	}
+	return requireOneOf("facts/"+id+"/value", value, values...)
+}
+
 func ReadDescribe(path string) (Describe, error) {
 	r, err := openReader(path)
 	if err != nil {
@@ -168,6 +184,9 @@ func ReadDescribe(path string) (Describe, error) {
 		base := "facts/" + id + "/"
 		value, err := r.text(base + "value")
 		if err != nil {
+			return Describe{}, err
+		}
+		if err := validateFactValue(id, value); err != nil {
 			return Describe{}, err
 		}
 		source, err := r.text(base + "source")
@@ -201,6 +220,9 @@ func ReadDescribe(path string) (Describe, error) {
 		}
 		if err := requireOneOf(base+"selectable", selectableText, "yes", "no"); err != nil {
 			return Describe{}, err
+		}
+		if id == "zunit" && selectableText != "no" {
+			return Describe{}, fmt.Errorf("%s compatibility profile must not be selectable", base)
 		}
 		reason, err := r.text(base + "reason")
 		if err != nil {
@@ -463,11 +485,16 @@ func ReadResult(path string) (Result, error) {
 		}
 		result.Error = &ResultError{Code: code, Operation: operation, Detail: detail}
 	}
-	result.ReceiptPath, _, err = r.optionalText("receipt/path")
+	receiptPresent := false
+	result.ReceiptPath, receiptPresent, err = r.optionalText("receipt/path")
 	if err != nil {
 		return Result{}, err
 	}
-	if result.ReceiptPath != "" && (result.Phase != "files" || result.Status != "succeeded" || !filepath.IsAbs(result.ReceiptPath) || filepath.Clean(result.ReceiptPath) != result.ReceiptPath) {
+	if result.Phase == "files" && result.Status == "succeeded" {
+		if !receiptPresent || result.ReceiptPath == "" || !filepath.IsAbs(result.ReceiptPath) || filepath.Clean(result.ReceiptPath) != result.ReceiptPath {
+			return Result{}, fmt.Errorf("successful files result has invalid receipt/path")
+		}
+	} else if receiptPresent {
 		return Result{}, fmt.Errorf("receipt/path is invalid for %s phase status %s", result.Phase, result.Status)
 	}
 	return result, nil

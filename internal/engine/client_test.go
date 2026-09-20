@@ -87,6 +87,7 @@ func TestWorkspaceRejectsMismatchedResultPhase(t *testing.T) {
 	shellPath := filepath.Join(home, "fake-shell")
 	fixture := strings.Replace(fakeShell, "printf '%s\\n' \"$phase\" >\"$result/phase\"", "printf '%s\\n' files >\"$result/phase\"", 1)
 	fixture = strings.Replace(fixture, "operation=checkout-sync\n  [ \"$phase\" = checkout ] || operation=write-files", "operation=write-files", 1)
+	fixture = strings.Replace(fixture, "[ \"$phase\" = files ]", "[ files = files ]", 1)
 	if err := os.WriteFile(shellPath, []byte(fixture), 0o700); err != nil {
 		t.Fatal(err)
 	}

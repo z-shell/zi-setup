@@ -31,6 +31,7 @@ type Model struct {
 	cursor         int
 	tab            int
 	busy           bool
+	applying       bool
 	busyLabel      string
 	confirm        bool
 	showDetails    bool
@@ -116,6 +117,7 @@ func (m *Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 	case applyDone:
 		m.publishSession(msg.session)
 		m.busy = false
+		m.applying = false
 		m.busyLabel = ""
 		m.err = msg.err
 		m.applicationErr = msg.err
@@ -179,7 +181,7 @@ func (m *Model) publishSession(next *workflow.Session) {
 
 func (m *Model) handleKey(key string) tea.Cmd {
 	if key == "ctrl+c" {
-		if m.busy && m.session.Stage == workflow.StageApply {
+		if m.busy && m.applying {
 			return nil
 		}
 		m.cancel()
@@ -220,6 +222,7 @@ func (m *Model) handleKey(key string) tea.Cmd {
 			switch key {
 			case "y", "enter":
 				m.busy = true
+				m.applying = true
 				m.busyLabel = "Applying checkout, then files"
 				m.err = nil
 				return m.applyCmd()
@@ -315,7 +318,7 @@ func (m *Model) header() string {
 
 func (m *Model) footer() string {
 	if m.busy {
-		if m.session.Stage == workflow.StageApply {
+		if m.applying {
 			return m.styles.active.Render(m.busyLabel) + "  operation is not interruptible"
 		}
 		return m.styles.active.Render(m.busyLabel) + "  ctrl+c cancel"

@@ -77,6 +77,29 @@ func TestRejectsUnknownOrHostileArtifacts(t *testing.T) {
 			t.Fatalf("error = %v", err)
 		}
 	})
+	t.Run("invalid fact enum", func(t *testing.T) {
+		for _, id := range []string{"zi-home-state", "zshrc-state", "git", "zsh", "tty", "existing-profile"} {
+			t.Run(id, func(t *testing.T) {
+				root := describeFixture(t)
+				writeFields(t, root, map[string]string{"facts/" + id + "/value": "bogus\n"})
+				if _, err := ReadDescribe(root); err == nil || !strings.Contains(err.Error(), "unsupported value") {
+					t.Fatalf("error = %v", err)
+				}
+			})
+		}
+	})
+	t.Run("selectable compatibility profile", func(t *testing.T) {
+		root := describeFixture(t)
+		writeFields(t, root, map[string]string{
+			"profiles/order":            "loader\nannex\nzunit\n",
+			"profiles/zunit/selectable": "yes\n",
+			"profiles/zunit/reason":     "Legacy configuration detected\n",
+			"profiles/zunit/title":      "Legacy zunit\n",
+		})
+		if _, err := ReadDescribe(root); err == nil || !strings.Contains(err.Error(), "must not be selectable") {
+			t.Fatalf("error = %v", err)
+		}
+	})
 	t.Run("duplicate plan metadata", func(t *testing.T) {
 		root := planFixture(t)
 		file := filepath.Join(root, "plan.meta")
@@ -105,6 +128,19 @@ func TestRejectsUnknownOrHostileArtifacts(t *testing.T) {
 			t.Fatalf("error = %v", err)
 		}
 	})
+	t.Run("successful files result missing receipt", func(t *testing.T) {
+		root := filesResultFixture(t, nil)
+		if _, err := ReadResult(root); err == nil || !strings.Contains(err.Error(), "invalid receipt/path") {
+			t.Fatalf("error = %v", err)
+		}
+	})
+	t.Run("receipt on checkout result", func(t *testing.T) {
+		root := resultFixture(t)
+		writeFields(t, root, map[string]string{"receipt/path": "/fixture/config/setup/receipt\n"})
+		if _, err := ReadResult(root); err == nil || !strings.Contains(err.Error(), "invalid for checkout") {
+			t.Fatalf("error = %v", err)
+		}
+	})
 	t.Run("symlink root", func(t *testing.T) {
 		realRoot := describeFixture(t)
 		link := filepath.Join(t.TempDir(), "artifact")
@@ -115,6 +151,18 @@ func TestRejectsUnknownOrHostileArtifacts(t *testing.T) {
 			t.Fatalf("error = %v", err)
 		}
 	})
+}
+
+func TestReadSuccessfulFilesResultReceipt(t *testing.T) {
+	t.Parallel()
+	receipt := "/fixture/config/setup/receipt"
+	result, err := ReadResult(filesResultFixture(t, &receipt))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.ReceiptPath != receipt {
+		t.Fatalf("receipt path = %q", result.ReceiptPath)
+	}
 }
 
 func resultFixture(t *testing.T) string {
@@ -129,6 +177,25 @@ func resultFixture(t *testing.T) string {
 		"operations/checkout-sync/status": "succeeded\n",
 		"operations/checkout-sync/detail": "complete\n",
 	})
+	return root
+}
+
+func filesResultFixture(t *testing.T, receipt *string) string {
+	t.Helper()
+	root := t.TempDir()
+	fields := map[string]string{
+		"format":                        "zi-setup-result-v1\n",
+		"plan.id":                       strings.Repeat("a", 64) + "\n",
+		"phase":                         "files\n",
+		"status":                        "succeeded\n",
+		"operations/order":              "write-files\n",
+		"operations/write-files/status": "succeeded\n",
+		"operations/write-files/detail": "complete\n",
+	}
+	if receipt != nil {
+		fields["receipt/path"] = *receipt + "\n"
+	}
+	writeFields(t, root, fields)
 	return root
 }
 

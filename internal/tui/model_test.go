@@ -46,7 +46,19 @@ func TestModelCompletesCompactKeyboardFlow(t *testing.T) {
 	if applyCommand == nil {
 		t.Fatal("confirmation did not start apply")
 	}
+	if !model.busy || !model.applying || session.Stage != workflow.StageReview {
+		t.Fatalf("in-flight apply state = busy %v, applying %v, stage %s", model.busy, model.applying, session.Stage)
+	}
+	if command := model.handleKey("ctrl+c"); command != nil || model.ctx.Err() != nil {
+		t.Fatalf("ctrl+c interrupted in-flight apply: command %v, context %v", command, model.ctx.Err())
+	}
+	if content := model.footer(); !strings.Contains(content, "not interruptible") {
+		t.Fatalf("busy footer does not disclose cancellation boundary: %q", content)
+	}
 	model.Update(applyCommand())
+	if model.applying {
+		t.Fatal("completed apply remained marked in flight")
+	}
 	if session.Stage != workflow.StageResult || !session.ReopenHasNoContentChanges() {
 		t.Fatalf("result stage = %s, reopen unchanged = %v", session.Stage, session.ReopenHasNoContentChanges())
 	}
@@ -55,21 +67,6 @@ func TestModelCompletesCompactKeyboardFlow(t *testing.T) {
 	}
 	if content := model.View().Content; !strings.Contains(content, "reopen: no content changes") {
 		t.Fatalf("result view missing verification:\n%s", content)
-	}
-}
-
-func TestApplyIgnoresInterruptKey(t *testing.T) {
-	t.Parallel()
-	session := workflow.New(&modelEngine{})
-	session.Stage = workflow.StageApply
-	model := New(context.Background(), session, Options{NoColor: true})
-	model.busy = true
-	model.busyLabel = "Applying checkout, then files"
-	if command := model.handleKey("ctrl+c"); command != nil {
-		t.Fatal("ctrl+c interrupted a non-interruptible apply")
-	}
-	if content := model.footer(); !strings.Contains(content, "not interruptible") {
-		t.Fatalf("busy footer does not disclose cancellation boundary: %q", content)
 	}
 }
 
