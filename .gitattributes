@@ -1,0 +1,5 @@
+# Go source is gofmt-formatted and always tab-indented. Do not let a
+# contributor's core.whitespace=tab-in-indent report valid indentation.
+*.go whitespace=-tab-in-indent
+go.mod whitespace=-tab-in-indent
+go.work whitespace=-tab-in-indent
