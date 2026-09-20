@@ -20,9 +20,15 @@ const (
 )
 
 type Engine interface {
+	Configure(string, bool) error
 	Describe(context.Context) (contract.Describe, engine.Output, error)
 	Plan(context.Context, string) (contract.Plan, engine.Output, error)
-	Apply(context.Context, string) (contract.Result, engine.Output, error)
+	Apply(context.Context, string, func(contract.ApplyEvent)) (contract.Result, engine.Output, error)
+}
+
+type Options struct {
+	Ref       string
+	SkipZshrc bool
 }
 
 type PhaseOutcome struct {
@@ -38,15 +44,25 @@ type Session struct {
 	DiscoveryOutput  engine.Output
 	DiscoveryErr     error
 	SelectedProfile  string
+	Ref              string
+	SkipZshrc        bool
 	Plan             contract.Plan
 	PlanOutput       engine.Output
 	Checkout         *PhaseOutcome
 	Files            *PhaseOutcome
 	VerificationPlan *contract.Plan
+	Events           []contract.ApplyEvent
 }
 
-func New(setupEngine Engine) *Session {
-	return &Session{engine: setupEngine, Stage: StageDiscover}
+func New(setupEngine Engine, options ...Options) *Session {
+	selection := Options{Ref: "main"}
+	if len(options) != 0 {
+		selection = options[0]
+		if selection.Ref == "" {
+			selection.Ref = "main"
+		}
+	}
+	return &Session{engine: setupEngine, Stage: StageDiscover, Ref: selection.Ref, SkipZshrc: selection.SkipZshrc}
 }
 
 // Clone returns an independent presentation-state copy that shares the engine.
@@ -54,6 +70,7 @@ func New(setupEngine Engine) *Session {
 // command completes.
 func (s *Session) Clone() *Session {
 	clone := *s
+	clone.Events = append([]contract.ApplyEvent(nil), s.Events...)
 	return &clone
 }
 
@@ -95,6 +112,9 @@ func (s *Session) BuildPlan(ctx context.Context) error {
 	if s.SelectedProfile == "" {
 		return errors.New("a selectable profile is required")
 	}
+	if err := s.engine.Configure(s.Ref, s.SkipZshrc); err != nil {
+		return err
+	}
 	plan, output, err := s.engine.Plan(ctx, s.SelectedProfile)
 	s.PlanOutput = output
 	if err != nil {
@@ -108,6 +128,20 @@ func (s *Session) BuildPlan(ctx context.Context) error {
 	return nil
 }
 
+func (s *Session) SetChoices(ref string, skipZshrc bool) {
+	if ref == "" {
+		ref = "main"
+	}
+	s.Ref = ref
+	s.SkipZshrc = skipZshrc
+	s.Plan = contract.Plan{}
+	s.PlanOutput = engine.Output{}
+	s.Checkout = nil
+	s.Files = nil
+	s.VerificationPlan = nil
+	s.Stage = StageChoose
+}
+
 func (s *Session) BackToChoose() {
 	s.Plan = contract.Plan{}
 	s.PlanOutput = engine.Output{}
@@ -117,12 +151,21 @@ func (s *Session) BackToChoose() {
 	s.Stage = StageChoose
 }
 
-func (s *Session) ApplyReviewedPlan(ctx context.Context) error {
+func (s *Session) ApplyReviewedPlan(ctx context.Context, observers ...func(contract.ApplyEvent)) error {
 	if s.Plan.ID == "" || s.Stage != StageReview {
 		return errors.New("a reviewed plan is required")
 	}
 	s.Stage = StageApply
-	checkout, output, err := s.engine.Apply(ctx, "checkout")
+	s.Events = nil
+	onEvent := func(event contract.ApplyEvent) {
+		s.Events = append(s.Events, event)
+		for _, observer := range observers {
+			if observer != nil {
+				observer(event)
+			}
+		}
+	}
+	checkout, output, err := s.engine.Apply(ctx, "checkout", onEvent)
 	s.Checkout = &PhaseOutcome{Result: checkout, Output: output, Err: err}
 	if err != nil || checkout.Status != "succeeded" {
 		s.Stage = StageResult
@@ -131,7 +174,7 @@ func (s *Session) ApplyReviewedPlan(ctx context.Context) error {
 		}
 		return errors.New("checkout phase did not succeed")
 	}
-	files, output, err := s.engine.Apply(ctx, "files")
+	files, output, err := s.engine.Apply(ctx, "files", onEvent)
 	s.Files = &PhaseOutcome{Result: files, Output: output, Err: err}
 	s.Stage = StageResult
 	if err != nil {

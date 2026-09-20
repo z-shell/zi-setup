@@ -68,7 +68,14 @@ func Run(ctx context.Context, session *workflow.Session, options Options) error 
 			return fmt.Errorf("plan was not approved")
 		}
 	}
-	applyErr := session.ApplyReviewedPlan(ctx)
+	applyErr := session.ApplyReviewedPlan(ctx, func(event contract.ApplyEvent) {
+		fmt.Fprintf(options.Output, "[%s] %s %s: %s\n",
+			presentation.SafeText(event.Phase),
+			presentation.SafeText(event.Operation),
+			presentation.SafeText(event.Status),
+			presentation.SafeText(event.Detail),
+		)
+	})
 	if applyErr == nil {
 		if err := session.VerifyReopen(ctx); err != nil {
 			applyErr = fmt.Errorf("verify reopen: %w", err)

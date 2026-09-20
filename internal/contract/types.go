@@ -121,3 +121,12 @@ type Result struct {
 	Error       *ResultError
 	ReceiptPath string
 }
+
+type ApplyEvent struct {
+	Sequence  int
+	Format    string
+	Phase     string
+	Operation string
+	Status    string
+	Detail    string
+}

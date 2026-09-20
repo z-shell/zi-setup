@@ -47,6 +47,9 @@ func TestRunRequiresExactPlanApproval(t *testing.T) {
 			if !test.yes && !strings.Contains(output.String(), "Type apply "+planID) {
 				t.Fatalf("output does not bind approval to plan id:\n%s", output.String())
 			}
+			if !test.wantErr && !strings.Contains(output.String(), "[checkout] checkout-sync started: synchronizing checkout") {
+				t.Fatalf("output does not include structured progress:\n%s", output.String())
+			}
 		})
 	}
 }
@@ -55,6 +58,8 @@ type plainEngine struct {
 	planID string
 	phases []string
 }
+
+func (f *plainEngine) Configure(string, bool) error { return nil }
 
 func (f *plainEngine) Describe(context.Context) (contract.Describe, engine.Output, error) {
 	return contract.Describe{
@@ -71,7 +76,14 @@ func (f *plainEngine) Plan(context.Context, string) (contract.Plan, engine.Outpu
 	}, engine.Output{}, nil
 }
 
-func (f *plainEngine) Apply(_ context.Context, phase string) (contract.Result, engine.Output, error) {
+func (f *plainEngine) Apply(_ context.Context, phase string, onEvent func(contract.ApplyEvent)) (contract.Result, engine.Output, error) {
 	f.phases = append(f.phases, phase)
+	operation := "checkout-sync"
+	if phase == "files" {
+		operation = "write-files"
+	}
+	if onEvent != nil {
+		onEvent(contract.ApplyEvent{Format: "zi-setup-event-v1", Phase: phase, Operation: operation, Status: "started", Detail: "synchronizing checkout"})
+	}
 	return contract.Result{Format: "zi-setup-result-v1", PlanID: f.planID, Phase: phase, Status: "succeeded"}, engine.Output{}, nil
 }

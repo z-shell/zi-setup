@@ -25,6 +25,16 @@ func TestModelCompletesCompactKeyboardFlow(t *testing.T) {
 	if content := model.View().Content; !strings.Contains(content, "zi> setup") || !strings.Contains(content, "Choose a starting point") {
 		t.Fatalf("compact choose view missing content:\n%s", content)
 	}
+	model.Update(tea.KeyPressMsg{Code: 'i'})
+	if !session.SkipZshrc || !strings.Contains(model.View().Content, "leave .zshrc unchanged") {
+		t.Fatalf("integration choice was not updated:\n%s", model.View().Content)
+	}
+	model.Update(tea.KeyPressMsg{Code: 'r'})
+	model.refDraft = "v2.1.0"
+	model.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
+	if session.Ref != "v2.1.0" {
+		t.Fatalf("ref = %q", session.Ref)
+	}
 	model.cursor = 1
 	planCommand := model.handleKey("enter")
 	if planCommand == nil {
@@ -33,6 +43,9 @@ func TestModelCompletesCompactKeyboardFlow(t *testing.T) {
 	model.Update(planCommand())
 	if session.Stage != workflow.StageReview || session.Plan.ID == "" {
 		t.Fatalf("review state = %s, plan = %#v", session.Stage, session.Plan)
+	}
+	if fake.ref != "v2.1.0" || !fake.skipZshrc {
+		t.Fatalf("engine choices = ref %q, skip-zshrc %v", fake.ref, fake.skipZshrc)
 	}
 	model.handleKey("tab")
 	if model.tab != 1 || !strings.Contains(model.View().Content, "Generated Zsh") {
@@ -55,7 +68,14 @@ func TestModelCompletesCompactKeyboardFlow(t *testing.T) {
 	if content := model.footer(); !strings.Contains(content, "not interruptible") {
 		t.Fatalf("busy footer does not disclose cancellation boundary: %q", content)
 	}
-	model.Update(applyCommand())
+	batch, ok := applyCommand().(tea.BatchMsg)
+	if !ok || len(batch) != 2 {
+		t.Fatalf("apply command returned %T", applyCommand())
+	}
+	model.Update(batch[0]())
+	for eventCommand := batch[1]; eventCommand != nil; {
+		_, eventCommand = model.Update(eventCommand())
+	}
 	if model.applying {
 		t.Fatal("completed apply remained marked in flight")
 	}
@@ -65,13 +85,40 @@ func TestModelCompletesCompactKeyboardFlow(t *testing.T) {
 	if fake.phases != "checkout,files" {
 		t.Fatalf("phase order = %s", fake.phases)
 	}
+	if model.lastEvent == nil || model.lastEvent.Operation != "write-files" || model.lastEvent.Status != "succeeded" {
+		t.Fatalf("last event = %#v", model.lastEvent)
+	}
 	if content := model.View().Content; !strings.Contains(content, "reopen: no content changes") {
 		t.Fatalf("result view missing verification:\n%s", content)
 	}
 }
 
+func TestRefEditorAcceptsOnlyPrintableRefText(t *testing.T) {
+	t.Parallel()
+	session := workflow.New(&modelEngine{})
+	model := New(context.Background(), session, Options{NoColor: true})
+	model.refEditing = true
+	model.refDraft = "main"
+	model.Update(tea.KeyPressMsg{Code: tea.KeyLeft})
+	if model.refDraft != "main" {
+		t.Fatalf("special key changed ref to %q", model.refDraft)
+	}
+	model.Update(tea.KeyPressMsg{Code: '/', Text: "/feature"})
+	if model.refDraft != "main/feature" {
+		t.Fatalf("printable text produced ref %q", model.refDraft)
+	}
+}
+
 type modelEngine struct {
-	phases string
+	phases    string
+	ref       string
+	skipZshrc bool
+}
+
+func (f *modelEngine) Configure(ref string, skipZshrc bool) error {
+	f.ref = ref
+	f.skipZshrc = skipZshrc
+	return nil
 }
 
 func (f *modelEngine) Describe(context.Context) (contract.Describe, engine.Output, error) {
@@ -98,7 +145,7 @@ func (f *modelEngine) Plan(context.Context, string) (contract.Plan, engine.Outpu
 	}, engine.Output{}, nil
 }
 
-func (f *modelEngine) Apply(_ context.Context, phase string) (contract.Result, engine.Output, error) {
+func (f *modelEngine) Apply(_ context.Context, phase string, onEvent func(contract.ApplyEvent)) (contract.Result, engine.Output, error) {
 	if f.phases != "" {
 		f.phases += ","
 	}
@@ -106,6 +153,10 @@ func (f *modelEngine) Apply(_ context.Context, phase string) (contract.Result, e
 	operation := "checkout-sync"
 	if phase == "files" {
 		operation = "write-files"
+	}
+	if onEvent != nil {
+		onEvent(contract.ApplyEvent{Format: "zi-setup-event-v1", Phase: phase, Operation: operation, Status: "started", Detail: "working"})
+		onEvent(contract.ApplyEvent{Format: "zi-setup-event-v1", Phase: phase, Operation: operation, Status: "succeeded", Detail: "complete"})
 	}
 	return contract.Result{
 		Format:     "zi-setup-result-v1",

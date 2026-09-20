@@ -2,6 +2,17 @@ package main
 
 import "testing"
 
+func TestParseFlagsUsesBundledEngineByDefault(t *testing.T) {
+	t.Setenv("ZI_SETUP_ENGINE", "")
+	got, err := parseFlags(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.enginePath != "" {
+		t.Fatalf("engine path = %q, want bundled engine", got.enginePath)
+	}
+}
+
 func TestUseLinearHonorsCommandLineIntent(t *testing.T) {
 	t.Parallel()
 	tests := []struct {

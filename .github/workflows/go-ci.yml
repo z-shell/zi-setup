@@ -47,6 +47,8 @@ jobs:
         run: go test -count=1 ./...
       - name: Run race tests
         run: go test -race -count=1 ./...
+      - name: Test release packaging
+        run: ./scripts/test-package-release.sh
 
   cross-build:
     name: Build ${{ matrix.goos }} ${{ matrix.goarch }}
