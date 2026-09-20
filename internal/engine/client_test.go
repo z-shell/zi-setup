@@ -2,11 +2,125 @@ package engine
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/z-shell/zi-setup/internal/contract"
 )
+
+func TestReadEventsDeliversAtomicDirectoriesInSequence(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	for sequence, status := range []string{"started", "succeeded"} {
+		path := filepath.Join(root, "00000"+string(rune('1'+sequence)))
+		if err := os.Mkdir(path, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		for name, value := range map[string]string{
+			"format": "zi-setup-event-v1", "phase": "checkout", "operation": "checkout-sync",
+			"status": status, "detail": "fixture",
+		} {
+			if err := os.WriteFile(filepath.Join(path, name), []byte(value+"\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	var events []contract.ApplyEvent
+	next, err := readEvents(root, 1, func(event contract.ApplyEvent) { events = append(events, event) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if next != 3 || len(events) != 2 || events[0].Sequence != 1 || events[1].Status != "succeeded" {
+		t.Fatalf("next = %d, events = %#v", next, events)
+	}
+}
+
+func TestRunWithEventsRejectsMissingTerminalEvent(t *testing.T) {
+	t.Parallel()
+	home := t.TempDir()
+	enginePath := filepath.Join(home, "setup.sh")
+	if err := os.WriteFile(enginePath, []byte("# fixture\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	shellPath := filepath.Join(home, "fake-shell")
+	fixture := `#!/bin/sh
+set -eu
+shift
+events=
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = --events ]; then events=$2; shift 2; else shift; fi
+done
+event=$events/000001
+mkdir -p "$event"
+printf '%s\n' zi-setup-event-v1 >"$event/format"
+printf '%s\n' checkout >"$event/phase"
+printf '%s\n' checkout-sync >"$event/operation"
+printf '%s\n' started >"$event/status"
+printf '%s\n' started >"$event/detail"
+exit 5
+`
+	if err := os.WriteFile(shellPath, []byte(fixture), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	workspace, err := (Client{EnginePath: enginePath, ShellPath: shellPath, TempParent: home}).NewWorkspace(Inputs{Home: home})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer workspace.Close()
+	events := filepath.Join(home, "events")
+	_, err = workspace.runWithEvents(context.Background(), []string{"apply", "--events", events}, events, nil)
+	if err == nil || !strings.Contains(err.Error(), "started event without a terminal event") {
+		t.Fatalf("missing terminal event error = %v", err)
+	}
+}
+
+func TestRunWithEventsAllowsMissingTerminalOnContextCancellation(t *testing.T) {
+	t.Parallel()
+	home := t.TempDir()
+	enginePath := filepath.Join(home, "setup.sh")
+	if err := os.WriteFile(enginePath, []byte("# fixture\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	shellPath := filepath.Join(home, "fake-shell")
+	fixture := `#!/bin/sh
+set -eu
+shift
+events=
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = --events ]; then events=$2; shift 2; else shift; fi
+done
+event=$events/000001
+mkdir -p "$event"
+printf '%s\n' zi-setup-event-v1 >"$event/format"
+printf '%s\n' checkout >"$event/phase"
+printf '%s\n' checkout-sync >"$event/operation"
+printf '%s\n' started >"$event/status"
+printf '%s\n' started >"$event/detail"
+while :; do :; done
+`
+	if err := os.WriteFile(shellPath, []byte(fixture), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	workspace, err := (Client{EnginePath: enginePath, ShellPath: shellPath, TempParent: home}).NewWorkspace(Inputs{Home: home})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer workspace.Close()
+	events := filepath.Join(home, "events")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	_, err = workspace.runWithEvents(ctx, []string{"apply", "--events", events}, events, func(contract.ApplyEvent) { cancel() })
+	var commandErr *CommandError
+	if !errors.As(err, &commandErr) || commandErr.ExitCode != 6 {
+		t.Fatalf("cancellation error = %v", err)
+	}
+	if strings.Contains(err.Error(), "started event without a terminal event") {
+		t.Fatalf("cancellation treated missing terminal event as a contract error: %v", err)
+	}
+}
 
 func TestWorkspacePassesExactPlanHashToBothPhases(t *testing.T) {
 	t.Parallel()
@@ -47,8 +161,15 @@ func TestWorkspacePassesExactPlanHashToBothPhases(t *testing.T) {
 	if plan.ID != strings.Repeat("a", 64) || plan.Meta.Profile != "annex" {
 		t.Fatalf("plan = %#v", plan)
 	}
+	if err := workspace.Configure("release/ref", true); err != nil {
+		t.Fatal(err)
+	}
+	plan, _, err = workspace.Plan(context.Background(), "annex")
+	if err != nil {
+		t.Fatal(err)
+	}
 	for _, phase := range []string{"checkout", "files"} {
-		result, _, err := workspace.Apply(context.Background(), phase)
+		result, _, err := workspace.Apply(context.Background(), phase, nil)
 		if err != nil {
 			t.Fatalf("apply %s: %v", phase, err)
 		}
@@ -64,7 +185,7 @@ func TestWorkspacePassesExactPlanHashToBothPhases(t *testing.T) {
 	if strings.Count(text, "--expect="+plan.ID) != 2 {
 		t.Fatalf("exact plan hash was not passed twice:\n%s", text)
 	}
-	for _, value := range []string{"--config-home=" + filepath.Join(home, "config home"), "--zshrc=" + filepath.Join(home, "dot files", ".zshrc"), "--ref=feature/ref"} {
+	for _, value := range []string{"--config-home=" + filepath.Join(home, "config home"), "--zshrc=" + filepath.Join(home, "dot files", ".zshrc"), "--ref=feature/ref", "--ref=release/ref", "--skip-zshrc"} {
 		if !strings.Contains(text, value) {
 			t.Errorf("invocation log missing %q:\n%s", value, text)
 		}
@@ -99,7 +220,7 @@ func TestWorkspaceRejectsMismatchedResultPhase(t *testing.T) {
 	if _, _, err := workspace.Plan(context.Background(), "loader"); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := workspace.Apply(context.Background(), "checkout"); err == nil || !strings.Contains(err.Error(), `checkout apply returned a "files" result`) {
+	if _, _, err := workspace.Apply(context.Background(), "checkout", nil); err == nil || !strings.Contains(err.Error(), `checkout apply returned a "files" result`) {
 		t.Fatalf("phase mismatch error = %v", err)
 	}
 }

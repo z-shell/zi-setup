@@ -17,6 +17,7 @@ const (
 	describeFormat = "zi-setup-describe-v1"
 	planFormat     = "zi-setup-plan-v1"
 	resultFormat   = "zi-setup-result-v1"
+	eventFormat    = "zi-setup-event-v1"
 	metadataLimit  = 64 << 10
 	contentLimit   = 8 << 20
 )
@@ -498,4 +499,42 @@ func ReadResult(path string) (Result, error) {
 		return Result{}, fmt.Errorf("receipt/path is invalid for %s phase status %s", result.Phase, result.Status)
 	}
 	return result, nil
+}
+
+func ReadApplyEvent(path string) (ApplyEvent, error) {
+	r, err := openReader(path)
+	if err != nil {
+		return ApplyEvent{}, err
+	}
+	defer r.close()
+	event := ApplyEvent{}
+	for name, destination := range map[string]*string{
+		"format":    &event.Format,
+		"phase":     &event.Phase,
+		"operation": &event.Operation,
+		"status":    &event.Status,
+		"detail":    &event.Detail,
+	} {
+		*destination, err = r.text(name)
+		if err != nil {
+			return ApplyEvent{}, err
+		}
+	}
+	if event.Format != eventFormat {
+		return ApplyEvent{}, fmt.Errorf("unsupported event format %q", event.Format)
+	}
+	if err := requireOneOf("phase", event.Phase, "checkout", "files"); err != nil {
+		return ApplyEvent{}, err
+	}
+	if !idPattern.MatchString(event.Operation) {
+		return ApplyEvent{}, fmt.Errorf("operation has invalid id %q", event.Operation)
+	}
+	expectedOperation := map[string]string{"checkout": "checkout-sync", "files": "write-files"}[event.Phase]
+	if event.Operation != expectedOperation {
+		return ApplyEvent{}, fmt.Errorf("phase %q event has operation %q, expected %q", event.Phase, event.Operation, expectedOperation)
+	}
+	if err := requireOneOf("status", event.Status, "started", "succeeded", "failed"); err != nil {
+		return ApplyEvent{}, err
+	}
+	return event, nil
 }

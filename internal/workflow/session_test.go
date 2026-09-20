@@ -114,6 +114,8 @@ type fakeEngine struct {
 	plans      int
 }
 
+func (f *fakeEngine) Configure(string, bool) error { return nil }
+
 func (f *fakeEngine) Describe(context.Context) (contract.Describe, engine.Output, error) {
 	return contract.Describe{
 		Format: "zi-setup-describe-v1",
@@ -135,7 +137,7 @@ func (f *fakeEngine) Plan(_ context.Context, profile string) (contract.Plan, eng
 	}, engine.Output{}, nil
 }
 
-func (f *fakeEngine) Apply(_ context.Context, phase string) (contract.Result, engine.Output, error) {
+func (f *fakeEngine) Apply(_ context.Context, phase string, _ func(contract.ApplyEvent)) (contract.Result, engine.Output, error) {
 	f.applyCalls = append(f.applyCalls, phase)
 	result := contract.Result{Format: "zi-setup-result-v1", PlanID: strings.Repeat("b", 64), Phase: phase, Status: "succeeded"}
 	if phase == f.failPhase {

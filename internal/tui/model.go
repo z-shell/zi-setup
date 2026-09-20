@@ -3,7 +3,9 @@ package tui
 import (
 	"context"
 	"fmt"
+	"regexp"
 	"strings"
+	"unicode/utf8"
 
 	"charm.land/bubbles/v2/viewport"
 	tea "charm.land/bubbletea/v2"
@@ -12,6 +14,8 @@ import (
 	"github.com/z-shell/zi-setup/internal/presentation"
 	"github.com/z-shell/zi-setup/internal/workflow"
 )
+
+var refPattern = regexp.MustCompile(`^[A-Za-z0-9._/-]+$`)
 
 type Options struct {
 	Theme   string
@@ -37,6 +41,11 @@ type Model struct {
 	showDetails    bool
 	err            error
 	applicationErr error
+	refDraft       string
+	refErr         error
+	refEditing     bool
+	applyEvents    chan contract.ApplyEvent
+	lastEvent      *contract.ApplyEvent
 }
 
 type discoveryDone struct {
@@ -50,6 +59,10 @@ type planDone struct {
 type applyDone struct {
 	session *workflow.Session
 	err     error
+}
+type applyEventMsg struct {
+	event contract.ApplyEvent
+	ok    bool
 }
 
 func New(ctx context.Context, session *workflow.Session, options Options) *Model {
@@ -66,7 +79,15 @@ func New(ctx context.Context, session *workflow.Session, options Options) *Model
 		viewport: view,
 		width:    80,
 		height:   24,
+		refDraft: session.Ref,
 	}
+}
+
+func validateRef(value string) error {
+	if value == "" || strings.HasPrefix(value, "-") || strings.Contains(value, "..") || !refPattern.MatchString(value) {
+		return fmt.Errorf("use letters, digits, '.', '_', '/', or '-' with no leading '-' or '..'")
+	}
+	return nil
 }
 
 func Run(ctx context.Context, session *workflow.Session, options Options) error {
@@ -99,7 +120,35 @@ func (m *Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		m.width, m.height = msg.Width, msg.Height
 		m.resize()
 	case tea.KeyPressMsg:
-		command = m.handleKey(msg.String())
+		if msg.String() == "ctrl+c" {
+			command = m.handleKey(msg.String())
+		} else if m.refEditing {
+			switch msg.String() {
+			case "enter":
+				if m.refErr = validateRef(m.refDraft); m.refErr == nil {
+					m.session.SetChoices(m.refDraft, m.session.SkipZshrc)
+					m.refEditing = false
+				}
+			case "esc":
+				m.refDraft = m.session.Ref
+				m.refErr = nil
+				m.refEditing = false
+			case "backspace":
+				if m.refDraft != "" {
+					_, size := utf8.DecodeLastRuneInString(m.refDraft)
+					m.refDraft = m.refDraft[:len(m.refDraft)-size]
+				}
+				m.refErr = validateRef(m.refDraft)
+			default:
+				text := msg.Key().Text
+				if text != "" && len(m.refDraft)+len(text) <= 256 && refPattern.MatchString(text) {
+					m.refDraft += text
+				}
+				m.refErr = validateRef(m.refDraft)
+			}
+		} else {
+			command = m.handleKey(msg.String())
+		}
 	case discoveryDone:
 		m.publishSession(msg.session)
 		m.busy = false
@@ -123,6 +172,16 @@ func (m *Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		m.applicationErr = msg.err
 		m.confirm = false
 		m.viewport.GotoTop()
+	case applyEventMsg:
+		if msg.ok {
+			event := msg.event
+			m.lastEvent = &event
+			m.busyLabel = event.Detail
+			if m.busyLabel == "" {
+				m.busyLabel = event.Operation + " " + event.Status
+			}
+			command = waitApplyEvent(m.applyEvents)
+		}
 	}
 	m.refresh()
 	if !m.busy {
@@ -162,14 +221,24 @@ func (m *Model) planCmd(profile string) tea.Cmd {
 	}
 }
 
-func (m *Model) applyCmd() tea.Cmd {
+func (m *Model) applyCmd(events chan<- contract.ApplyEvent) tea.Cmd {
 	next := m.session.Clone()
 	return func() tea.Msg {
-		err := next.ApplyReviewedPlan(m.ctx)
+		defer close(events)
+		err := next.ApplyReviewedPlan(m.ctx, func(event contract.ApplyEvent) {
+			events <- event
+		})
 		if err == nil {
 			err = next.VerifyReopen(m.ctx)
 		}
 		return applyDone{session: next, err: err}
+	}
+}
+
+func waitApplyEvent(events <-chan contract.ApplyEvent) tea.Cmd {
+	return func() tea.Msg {
+		event, ok := <-events
+		return applyEventMsg{event: event, ok: ok}
 	}
 }
 
@@ -216,6 +285,12 @@ func (m *Model) handleKey(key string) tea.Cmd {
 					return m.planCmd(choice.ID)
 				}
 			}
+		case "i":
+			m.session.SetChoices(m.session.Ref, !m.session.SkipZshrc)
+		case "r":
+			m.refDraft = m.session.Ref
+			m.refErr = nil
+			m.refEditing = true
 		}
 	case workflow.StageReview:
 		if m.confirm {
@@ -225,7 +300,9 @@ func (m *Model) handleKey(key string) tea.Cmd {
 				m.applying = true
 				m.busyLabel = "Applying checkout, then files"
 				m.err = nil
-				return m.applyCmd()
+				m.lastEvent = nil
+				m.applyEvents = make(chan contract.ApplyEvent, 32)
+				return tea.Batch(m.applyCmd(m.applyEvents), waitApplyEvent(m.applyEvents))
 			case "n", "esc":
 				m.confirm = false
 			}
@@ -325,7 +402,10 @@ func (m *Model) footer() string {
 	}
 	switch m.session.Stage {
 	case workflow.StageChoose:
-		return "↑/↓ choose  enter review  d details  q quit"
+		if m.refEditing {
+			return "type Zi ref  enter save  esc cancel"
+		}
+		return "↑/↓ choose  i integration  r ref  enter review  d details  q quit"
 	case workflow.StageReview:
 		if m.confirm {
 			return "y/enter apply exact plan  n/esc cancel"
@@ -340,7 +420,11 @@ func (m *Model) footer() string {
 
 func (m *Model) body() string {
 	if m.busy {
-		return "\n" + m.styles.active.Render(m.busyLabel) + "\n\nThe current operation has no fabricated percentage."
+		body := "\n" + m.styles.active.Render(m.busyLabel) + "\n\nThe current operation has no fabricated percentage."
+		if m.lastEvent != nil {
+			body += fmt.Sprintf("\n\n%s  %s  %s", presentation.SafeText(m.lastEvent.Phase), presentation.SafeText(m.lastEvent.Operation), presentation.SafeText(m.lastEvent.Status))
+		}
+		return body
 	}
 	if m.showDetails {
 		return m.detailsBody()
@@ -380,6 +464,21 @@ func (m *Model) chooseBody() string {
 		}
 		out.WriteString(line + "\n\n")
 	}
+	out.WriteString(m.styles.heading.Render("Setup choices") + "\n")
+	integration := "update .zshrc with the managed Zi block"
+	if m.session.SkipZshrc {
+		integration = "install only; leave .zshrc unchanged"
+	}
+	fmt.Fprintf(&out, "Integration       %s\n", integration)
+	if m.refEditing {
+		fmt.Fprintf(&out, "Zi ref: > %s_\n", presentation.SafeText(m.refDraft))
+		if m.refErr != nil {
+			out.WriteString(m.styles.error.Render(m.refErr.Error()) + "\n")
+		}
+	} else {
+		fmt.Fprintf(&out, "Zi ref            %s\n", presentation.SafeText(m.session.Ref))
+	}
+	out.WriteString("\n")
 	out.WriteString(m.styles.heading.Render("Discovered inputs") + "\n")
 	for _, fact := range m.session.Describe.Facts {
 		fmt.Fprintf(&out, "%-18s %s  %s/%s\n", fact.ID, presentation.SafeText(fact.Value), fact.Source, fact.Confidence)

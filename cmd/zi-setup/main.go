@@ -18,18 +18,19 @@ import (
 var version = "dev"
 
 type options struct {
-	enginePath  string
-	shellPath   string
-	plain       bool
-	headless    bool
-	profile     string
-	apply       bool
-	yes         bool
-	theme       string
-	noColor     bool
-	ascii       bool
-	showVersion bool
-	inputs      engine.Inputs
+	enginePath   string
+	engineEvents bool
+	shellPath    string
+	plain        bool
+	headless     bool
+	profile      string
+	apply        bool
+	yes          bool
+	theme        string
+	noColor      bool
+	ascii        bool
+	showVersion  bool
+	inputs       engine.Inputs
 }
 
 func main() {
@@ -43,17 +44,17 @@ func run(arguments []string) int {
 		return 2
 	}
 	if options.showVersion {
-		fmt.Println("zi-setup " + version)
+		fmt.Printf("zi-setup %s\nengine %s\n", version, engine.BundledEngineRevision)
 		return 0
 	}
-	client := engine.Client{EnginePath: options.enginePath, ShellPath: options.shellPath}
+	client := engine.Client{EnginePath: options.enginePath, ShellPath: options.shellPath, Events: options.engineEvents}
 	workspace, err := client.NewWorkspace(options.inputs)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, presentation.SafeText(err.Error()))
 		return 2
 	}
 	defer workspace.Close()
-	session := workflow.New(workspace)
+	session := workflow.New(workspace, workflow.Options{Ref: options.inputs.Ref, SkipZshrc: options.inputs.SkipZshrc})
 	ctx := context.Background()
 	linear := useLinear(options, term.IsTerminal(int(os.Stdin.Fd())), term.IsTerminal(int(os.Stdout.Fd())))
 	if linear {
@@ -87,6 +88,7 @@ func parseFlags(arguments []string) (options, error) {
 	flags := flag.NewFlagSet("zi-setup", flag.ContinueOnError)
 	flags.SetOutput(os.Stderr)
 	flags.StringVar(&result.enginePath, "engine", os.Getenv("ZI_SETUP_ENGINE"), "path to public/sh/setup.sh")
+	flags.BoolVar(&result.engineEvents, "engine-events", false, "enable zi-setup-event-v1 for an external engine")
 	flags.StringVar(&result.shellPath, "shell", "sh", "POSIX shell used to invoke the engine")
 	flags.BoolVar(&result.plain, "plain", false, "use linear interactive output")
 	flags.BoolVar(&result.headless, "headless", false, "run without terminal control; requires --profile")
@@ -115,9 +117,6 @@ func parseFlags(arguments []string) (options, error) {
 	}
 	if result.showVersion {
 		return result, nil
-	}
-	if result.enginePath == "" {
-		return options{}, fmt.Errorf("--engine or ZI_SETUP_ENGINE is required for the local pilot")
 	}
 	switch result.profile {
 	case "", "loader", "annex":

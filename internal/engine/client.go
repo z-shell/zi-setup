@@ -8,8 +8,10 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/z-shell/zi-setup/internal/contract"
 )
@@ -33,6 +35,7 @@ type Client struct {
 	EnginePath string
 	ShellPath  string
 	TempParent string
+	Events     bool
 }
 
 type Output struct {
@@ -64,24 +67,18 @@ type Workspace struct {
 	sequence int
 	planPath string
 	plan     contract.Plan
+	events   bool
+}
+
+func (w *Workspace) Configure(ref string, skipZshrc bool) error {
+	w.inputs.Ref = ref
+	w.inputs.SkipZshrc = skipZshrc
+	w.planPath = ""
+	w.plan = contract.Plan{}
+	return nil
 }
 
 func (c Client) NewWorkspace(inputs Inputs) (*Workspace, error) {
-	if c.EnginePath == "" {
-		return nil, errors.New("engine path is required")
-	}
-	enginePath, err := filepath.Abs(c.EnginePath)
-	if err != nil {
-		return nil, fmt.Errorf("resolve engine path: %w", err)
-	}
-	info, err := os.Stat(enginePath)
-	if err != nil {
-		return nil, fmt.Errorf("stat engine: %w", err)
-	}
-	if !info.Mode().IsRegular() {
-		return nil, fmt.Errorf("engine is not a regular file: %s", enginePath)
-	}
-	c.EnginePath = enginePath
 	if c.ShellPath == "" {
 		c.ShellPath = "sh"
 	}
@@ -93,7 +90,31 @@ func (c Client) NewWorkspace(inputs Inputs) (*Workspace, error) {
 		os.RemoveAll(root)
 		return nil, fmt.Errorf("restrict artifact root: %w", err)
 	}
-	return &Workspace{client: c, inputs: inputs, root: root}, nil
+	bundled := c.EnginePath == ""
+	if bundled {
+		c.EnginePath, err = extractBundledEngine(root, &inputs)
+		if err != nil {
+			os.RemoveAll(root)
+			return nil, fmt.Errorf("prepare bundled engine: %w", err)
+		}
+	} else {
+		enginePath, resolveErr := filepath.Abs(c.EnginePath)
+		if resolveErr != nil {
+			os.RemoveAll(root)
+			return nil, fmt.Errorf("resolve engine path: %w", resolveErr)
+		}
+		info, statErr := os.Stat(enginePath)
+		if statErr != nil {
+			os.RemoveAll(root)
+			return nil, fmt.Errorf("stat engine: %w", statErr)
+		}
+		if !info.Mode().IsRegular() {
+			os.RemoveAll(root)
+			return nil, fmt.Errorf("engine is not a regular file: %s", enginePath)
+		}
+		c.EnginePath = enginePath
+	}
+	return &Workspace{client: c, inputs: inputs, root: root, events: bundled || c.Events}, nil
 }
 
 func (w *Workspace) Close() error {
@@ -139,7 +160,7 @@ func (w *Workspace) Plan(ctx context.Context, profile string) (contract.Plan, Ou
 	return plan, output, nil
 }
 
-func (w *Workspace) Apply(ctx context.Context, phase string) (contract.Result, Output, error) {
+func (w *Workspace) Apply(ctx context.Context, phase string, onEvent func(contract.ApplyEvent)) (contract.Result, Output, error) {
 	if w.planPath == "" || w.plan.ID == "" {
 		return contract.Result{}, Output{}, errors.New("no reviewed plan is available")
 	}
@@ -148,7 +169,12 @@ func (w *Workspace) Apply(ctx context.Context, phase string) (contract.Result, O
 	}
 	resultPath := w.nextPath("result-" + phase)
 	args := []string{"apply", "--plan", w.planPath, "--phase", phase, "--expect", w.plan.ID, "--result", resultPath}
-	output, runErr := w.run(ctx, args)
+	var eventPath string
+	if w.events {
+		eventPath = w.nextPath("events-" + phase)
+		args = append(args, "--events", eventPath)
+	}
+	output, runErr := w.runWithEvents(ctx, args, eventPath, onEvent)
 	result, readErr := contract.ReadResult(resultPath)
 	if readErr != nil {
 		if runErr != nil {
@@ -207,26 +233,131 @@ func appendValue(args []string, name, value string) []string {
 }
 
 func (w *Workspace) run(ctx context.Context, args []string) (Output, error) {
+	return w.runWithEvents(ctx, args, "", nil)
+}
+
+func (w *Workspace) runWithEvents(ctx context.Context, args []string, eventPath string, onEvent func(contract.ApplyEvent)) (Output, error) {
 	commandArgs := append([]string{w.client.EnginePath}, args...)
 	cmd := exec.CommandContext(ctx, w.client.ShellPath, commandArgs...)
 	cmd.Env = environment(w.inputs.Home)
 	var stdout, stderr limitedBuffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
-	err := cmd.Run()
+	err := cmd.Start()
+	if err == nil {
+		done := make(chan error, 1)
+		go func() { done <- cmd.Wait() }()
+		ticker := time.NewTicker(40 * time.Millisecond)
+		defer ticker.Stop()
+		nextEvent := 1
+		for {
+			select {
+			case err = <-done:
+				if eventPath != "" {
+					finalNext, eventErr := readEvents(eventPath, nextEvent, onEvent)
+					if eventErr == nil && err == nil && finalNext != 3 {
+						eventErr = fmt.Errorf("successful apply published %d events, expected 2", finalNext-1)
+					}
+					if eventErr == nil && err != nil && ctx.Err() == nil && finalNext == 2 {
+						eventErr = errors.New("apply published a started event without a terminal event")
+					}
+					if eventErr != nil {
+						err = fmt.Errorf("read apply events: %w", eventErr)
+					}
+				}
+				goto finished
+			case <-ticker.C:
+				if eventPath == "" {
+					continue
+				}
+				var eventErr error
+				nextEvent, eventErr = readEvents(eventPath, nextEvent, onEvent)
+				if eventErr != nil {
+					_ = cmd.Process.Kill()
+					<-done
+					err = fmt.Errorf("read apply events: %w", eventErr)
+					goto finished
+				}
+			}
+		}
+	}
+
+finished:
 	output := Output{Stdout: stdout.String(), Stderr: stderr.String()}
 	if err == nil {
 		return output, nil
 	}
 	exitCode := 1
 	var exitErr *exec.ExitError
-	if errors.As(err, &exitErr) {
-		exitCode = exitErr.ExitCode()
-	} else if ctx.Err() != nil {
+	if ctx.Err() != nil {
 		exitCode = 6
+	} else if errors.As(err, &exitErr) {
+		exitCode = exitErr.ExitCode()
 	}
 	output.ExitCode = exitCode
 	return output, &CommandError{Command: args[0], ExitCode: exitCode, Stderr: strings.TrimSpace(output.Stderr), Err: err}
+}
+
+func readEvents(path string, next int, onEvent func(contract.ApplyEvent)) (int, error) {
+	info, err := os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return next, nil
+	}
+	if err != nil {
+		return next, err
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+		return next, fmt.Errorf("event root must be a directory, got %s", info.Mode())
+	}
+	entries, err := os.ReadDir(path)
+	if err != nil {
+		return next, err
+	}
+	names := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), ".tmp-") {
+			continue
+		}
+		if !entry.IsDir() {
+			return next, fmt.Errorf("unexpected event entry %q", entry.Name())
+		}
+		names = append(names, entry.Name())
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		sequence, parseErr := strconv.Atoi(name)
+		if parseErr != nil || len(name) != 6 || fmt.Sprintf("%06d", sequence) != name || sequence < 1 {
+			return next, fmt.Errorf("invalid event sequence %q", name)
+		}
+		if sequence < next {
+			continue
+		}
+		if sequence != next {
+			return next, fmt.Errorf("event sequence jumped from %06d to %s", next, name)
+		}
+		event, readErr := contract.ReadApplyEvent(filepath.Join(path, name))
+		if readErr != nil {
+			return next, fmt.Errorf("read event %s: %w", name, readErr)
+		}
+		event.Sequence = sequence
+		switch sequence {
+		case 1:
+			if event.Status != "started" {
+				return next, fmt.Errorf("first event has status %q, expected started", event.Status)
+			}
+		case 2:
+			if event.Status != "succeeded" && event.Status != "failed" {
+				return next, fmt.Errorf("terminal event has status %q", event.Status)
+			}
+		default:
+			return next, fmt.Errorf("unexpected event %06d after terminal event", sequence)
+		}
+		if onEvent != nil {
+			onEvent(event)
+		}
+		next++
+	}
+	return next, nil
 }
 
 func environment(home string) []string {
