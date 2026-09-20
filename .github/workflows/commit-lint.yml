@@ -1,0 +1,17 @@
+---
+name: Commit Lint
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, edited]
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  policy:
+    name: Policy
+    permissions:
+      contents: read
+    uses: z-shell/.github/.github/workflows/commit-lint.yml@ce74af22db3af827eed9558596275cdf3fb07505 # main
